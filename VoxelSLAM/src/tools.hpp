@@ -198,6 +198,12 @@ struct IMUST
 
 };
 
+/**
+ * @brief 体素降采样，体素中的点是均值点
+ * 
+ * @param pl_feat 
+ * @param voxel_size 
+ */
 void down_sampling_voxel(pcl::PointCloud<PointType> &pl_feat, double voxel_size)
 {
   if(voxel_size < 0.001) return;
@@ -237,6 +243,12 @@ void down_sampling_voxel(pcl::PointCloud<PointType> &pl_feat, double voxel_size)
   
 }
 
+/**
+ * @brief 体素降采样，体素中的点是离均值点最近的一个点
+ * 
+ * @param pl_feat 
+ * @param voxel_size 
+ */
 void down_sampling_close(pcl::PointCloud<PointType> &pl_feat, double voxel_size)
 {
   if(voxel_size < 0.001) return;

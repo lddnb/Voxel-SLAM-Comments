@@ -167,6 +167,7 @@ public:
   void IMU_init(deque<sensor_msgs::Imu::Ptr> &imus)
   {
     Eigen::Vector3d cur_acc, cur_gyr;
+    // 增量计算均值
     for(sensor_msgs::Imu::Ptr imu: imus)
     {
       cur_acc << imu->linear_acceleration.x,
@@ -194,11 +195,20 @@ public:
     last_imu = imus.back();
   }
 
+  /**
+   * @brief imu初始化以及点云去畸变
+   * 
+   * @param x_curr 
+   * @param pcl_in 
+   * @param imus 
+   * @return int 
+   */
   int process(IMUST &x_curr, pcl::PointCloud<PointType> &pcl_in, deque<sensor_msgs::Imu::Ptr> &imus)
   {
     if(!init_flag)
     {
       IMU_init(imus);
+      // 修正imu单位
       if(mean_acc.norm() < 2 && imu_topic == "/livox/imu")
         scale_gravity = G_m_s2;
       printf("scale_gravity: %lf %lf %d\n", scale_gravity, mean_acc.norm(), init_num);

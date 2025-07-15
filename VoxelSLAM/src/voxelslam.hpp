@@ -102,6 +102,15 @@ void pcl_handler(T &msg)
   mBuf.unlock();
 }
 
+/**
+ * @brief 同步lidar点云和imu数据
+ * 
+ * @param pl_ptr 
+ * @param imus 
+ * @param p_imu 
+ * @return true 
+ * @return false 
+ */
 bool sync_packages(pcl::PointCloud<PointType>::Ptr &pl_ptr, deque<sensor_msgs::Imu::Ptr> &imus, IMUEKF &p_imu)
 {
   static bool pl_ready = false;
@@ -184,6 +193,15 @@ void calcBodyVar(Eigen::Vector3d &pb, const float range_inc, const float degree_
 };
 
 // Compute the variance of the each point
+/**
+ * @brief 计算点云在IMU系下的协方差
+ * 
+ * @param ext 
+ * @param pl_cur 
+ * @param pptr 
+ * @param dept_err 
+ * @param beam_err 
+ */
 void var_init(IMUST &ext, pcl::PointCloud<PointType> &pl_cur, PVecPtr pptr, double dept_err, double beam_err)
 {
   int plsize = pl_cur.size();
@@ -200,6 +218,10 @@ void var_init(IMUST &ext, pcl::PointCloud<PointType> &pl_cur, PVecPtr pptr, doub
   }
 }
 
+/**
+ * @brief 根据位姿传播点云的协方差至世界系下，转换得到世界系下的点云
+ * 
+ */
 void pvec_update(PVecPtr pptr, IMUST &x_curr, PLV(3) &pwld)
 {
   Eigen::Matrix3d rot_var = x_curr.cov.block<3, 3>(0, 0);

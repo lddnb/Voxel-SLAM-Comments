@@ -728,7 +728,7 @@ public:
   vector<PVecPtr> pvec_buf;
   deque<IMU_PRE*> imu_pre_buf;
   int win_count = 0, win_base = 0;
-  vector<vector<SlideWindow*>> sws;
+  vector<vector<SlideWindow*>> sws;  // 滑窗池，存放所有节点的滑窗，平时都放在sws[0], sws[thread_num]，用于多线程优化
 
   vector<ScanPose*> *scanPoses;
   mutex mtx_loop;
@@ -853,6 +853,13 @@ public:
   }
 
   // The point-to-plane alignment for odometry
+  /**
+   * @brief VoxelMap中的里程计，加了一个退化检测
+   * 
+   * @param pptr 
+   * @return true 
+   * @return false 
+   */
   bool lio_state_estimation(PVecPtr pptr)
   {
     IMUST x_prop = x_curr;
@@ -889,6 +896,7 @@ public:
         double sigma_d = 0;
         Plane* pla = nullptr;
         int flag = 0;
+        // 已知所在voxel，直接匹配平面
         if(octos[i] != nullptr && octos[i]->inside(wld))
         {
           double max_prob = 0;
@@ -896,6 +904,7 @@ public:
         }
         else
         {
+          // 不知道voxel，找所在的voxel，再匹配平面
           flag = match(surf_map, wld, pla, var_world, sigma_d, octos[i]);
         }
 
@@ -947,10 +956,12 @@ public:
       if(EKF_stop_flg) break;
     }
 
+    // 对法向量协方差做特征值分解
     Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> saes(nnt);
     Eigen::Vector3d evalue = saes.eigenvalues();
     // printf("eva %d: %lf\n", match_num, evalue[0]);
 
+    // 特征值最小的方向是平面约束最少的方向，如果特征值小于14，则认为约束不足，发生了退化
     if(evalue[0] < 14)
       return false;
     else
@@ -959,8 +970,14 @@ public:
 
   // The point-to-plane alignment for initialization
   pcl::PointCloud<PointType>::Ptr pl_tree;
+  /**
+   * @brief 初始化时的粗略状态估计
+   * 
+   * @param pptr 
+   */
   void lio_state_estimation_kdtree(PVecPtr pptr)
   {
+    // 用于初始化匹配的点云地图kdtree
     static pcl::KdTreeFLANN<PointType> kd_map;
     if(pl_tree->size() < 100)
     {
@@ -1019,10 +1036,12 @@ public:
             PointType &pp = pl_tree->points[nearInd[i]];
             A.row(i) << pp.x, pp.y, pp.z;
           }
+          // QR分解求平面法向量
           Eigen::Vector3d direct = A.colPivHouseholderQr().solve(b);
           bool check_flag = false;
           for(int i=0; i<NMATCH; i++)
           {
+            // 检查点面距离
             if(fabs(direct.dot(A.row(i)) + 1.0) > 0.1) 
               check_flag = true;
           }
@@ -1033,6 +1052,7 @@ public:
             continue;
           }
           
+          // 归一化处理
           double d = 1.0 / direct.norm();
           // direct *= d;
           ds[i] = d;
@@ -1043,7 +1063,9 @@ public:
         {
           double pd2 = directs[i].dot(wld) + ds[i];
           Eigen::Matrix<double, 6, 1> jac_s;
+          // H(R)^T = p*R^T*n
           jac_s.head(3) = phat * x_curr.R.transpose() * directs[i];
+          // H(t)^T = n
           jac_s.tail(3) = directs[i];
 
           HTH += jac_s * jac_s.transpose();
@@ -1065,6 +1087,7 @@ public:
       refind = false;
       if ((rot_add.norm() * 57.3 < 0.01) && (tra_add.norm() * 100 < 0.015))
       {
+        // 增量已经很小了，重新拟合平面
         refind = true;
         flg_EKF_converged = true;
         rematch_num++;
@@ -1077,6 +1100,7 @@ public:
 
       if(rematch_num >= 2 || (iterCount == num_max_iter-1))
       {
+        // 更新协方差
         x_curr.cov = (I_STATE - G) * x_curr.cov;
         EKF_stop_flg = true;
       }
@@ -1084,6 +1108,7 @@ public:
       if(EKF_stop_flg) break;
     }
 
+    // 优化之后重新用单帧点云构建kdtree
     double tt1 = ros::Time::now().toSec();
     for(pointVar pv: *pptr)
     {
@@ -1186,6 +1211,11 @@ public:
   }
 
   // load the previous keyframe in the local voxel map
+  /**
+   * @brief 把附近关键帧的点云加入到当前地图中
+   * 
+   * @param jour 
+   */
   void keyframe_loading(double jour)
   {
     if(history_kfsize <= 0) return;
@@ -1196,8 +1226,10 @@ public:
     ap_curr.z = x_curr.p[2];
     vector<int> vec_idx;
     vector<float> vec_dis;
+    // 找当前位置10米范围内的关键帧
     kd_keyframes.radiusSearch(ap_curr, 10, vec_idx, vec_dis);
 
+    // 把附近关键帧的点云加入到当前地图中
     for(int id: vec_idx)
     {
       int ord_kf = pl_kdmap->points[id].curvature;
@@ -1227,6 +1259,10 @@ public:
     
   }
 
+  /**
+   * @brief 初始化系统状态
+   * 
+   */
   int initialization(deque<sensor_msgs::Imu::Ptr> &imus, Eigen::MatrixXd &hess, LidarFactor &voxhess, PLV(3) &pwld, pcl::PointCloud<PointType>::Ptr pcl_curr)
   {
     static vector<pcl::PointCloud<PointType>::Ptr> pl_origs;
@@ -1275,18 +1311,26 @@ public:
     beg_times.push_back(odom_ekf.pcl_beg_time);
     vec_imus.push_back(imus);
 
+    // 积累滑窗达到10个时开始优化
     int is_success = 0;
     if(win_count >= win_size)
     {
       is_success = Initialization::instance().motion_init(pl_origs, vec_imus, beg_times, &hess, voxhess, x_buf, surf_map, surf_map_slide, pvec_buf, win_size, sws, x_curr, imu_pre_buf, extrin_para);
 
+      // 初始化失败，系统会进行重置
       if(is_success == 0)
         return -1;
       return 1;
     }
+    // 没进行滑窗优化时返回 0
     return 0;
   }
 
+  /**
+   * @brief 重置系统状态
+   * 
+   * @param imus 
+   */
   void system_reset(deque<sensor_msgs::Imu::Ptr> &imus)
   {
     for(auto iter=surf_map.begin(); iter!=surf_map.end(); iter++)
@@ -1395,6 +1439,15 @@ public:
   }
 
   // Determine the plane and recut the voxel map in octo-tree
+  /**
+   * @brief 多线程加速，对每个voxel进行初始化或者更新
+   * 
+   * @param feat_map 
+   * @param win_count 
+   * @param xs 
+   * @param voxopt 
+   * @param sws 
+   */
   void multi_recut(unordered_map<VOXEL_LOC, OctoTree*> &feat_map, int win_count, vector<IMUST> &xs, LidarFactor &voxopt, vector<vector<SlideWindow*>> &sws)
   {
     // for(auto iter=feat_map.begin(); iter!=feat_map.end(); iter++)
@@ -1410,6 +1463,7 @@ public:
     vector<thread*> mthreads(thd_num);
     double part = 1.0 * g_size / thd_num;
     int cnt = 0;
+    // 把所有voxel五等分
     for(auto iter=feat_map.begin(); iter!=feat_map.end(); iter++)
     {
       octss[cnt].push_back(iter->second);
@@ -1417,6 +1471,7 @@ public:
         cnt++;
     }
 
+    // 线程函数，用于对单个线程中的所有voxel进行初始化或者更新
     auto recut_func = [](int win_count, vector<OctoTree*> &oct, vector<IMUST> xxs, vector<SlideWindow*> &sw)
     {
       for(OctoTree *oc: oct)
@@ -1441,12 +1496,14 @@ public:
       }
     }
 
+    // 把所有线程的滑窗合并到第一个线程中
     for(int i=1; i<sws.size(); i++)
     {
       sws[0].insert(sws[0].end(), sws[i].begin(), sws[i].end());
       sws[i].clear();
     }
 
+    // 遍历所有voxel，提取点簇和voxel的平面相关信息
     for(auto iter=feat_map.begin(); iter!=feat_map.end(); iter++)
       iter->second->tras_opt(voxopt);
 
@@ -1461,6 +1518,7 @@ public:
     double jour = 0;
     int counter = 0;
 
+    // 当前帧lidar系点云
     pcl::PointCloud<PointType>::Ptr pcl_curr(new pcl::PointCloud<PointType>());
     int motion_init_flag = 1;
     pl_tree.reset(new pcl::PointCloud<PointType>());
@@ -1486,9 +1544,11 @@ public:
         break;
       }
 
+      // 当前帧点云对应的imu数据
       deque<sensor_msgs::Imu::Ptr> imus;
       if(!sync_packages(pcl_curr, imus, odom_ekf))
       {
+        // 没成功同步数据的时候清一下地图数据，释放内存
         if(octos_release.size() != 0)
         {
           int msize = octos_release.size();
@@ -1561,13 +1621,16 @@ public:
         }
         else
         {
+          // 只有初始化失败才会进行重置
           if(init == -1)
             system_reset(imus);
+          // init=0 只是没有进行滑窗优化，不做重置，直接跳过，下一帧继续积累滑窗
           continue;
         }
       }
       else
       {
+        // imu传播和点云去畸变
         if(odom_ekf.process(x_curr, *pcl_curr, imus) == 0)
           continue;
 
@@ -1583,6 +1646,7 @@ public:
         PVecPtr pptr(new PVec);
         var_init(extrin_para, pl_down, pptr, dept_err, beam_err);
 
+        // 里程计
         if(lio_state_estimation(pptr))
         {
           if(degrade_cnt > 0) degrade_cnt--;
@@ -1596,6 +1660,7 @@ public:
 
         t1 = ros::Time::now().toSec();
 
+        // 积累滑窗
         win_count++;
         x_buf.push_back(x_curr);
         pvec_buf.push_back(pptr);
@@ -1608,6 +1673,7 @@ public:
         keyframe_loading(jour);
         voxhess.clear(); voxhess.win_size = win_size;
 
+        //! 滑窗中的点簇是local系下的点簇，且分了不同帧的，voxel中的点簇是world系下的点簇，所有帧都是一个点簇
         // cut_voxel(surf_map, pvec_buf[win_count-1], win_count-1, surf_map_slide, win_size, pwld, sws[0]);
         cut_voxel_multi(surf_map, pvec_buf[win_count-1], win_count-1, surf_map_slide, win_size, pwld, sws);
         t2 = ros::Time::now().toSec();
@@ -1615,6 +1681,7 @@ public:
         multi_recut(surf_map_slide, win_count, x_buf, voxhess, sws);
         t3 = ros::Time::now().toSec();
 
+        // 发生退化，重置系统
         if(degrade_cnt > degrade_bound)
         {
           degrade_cnt = 0;
@@ -2614,8 +2681,11 @@ int main(int argc, char **argv)
   for(int i=0; i<vs.win_size; i++)
     mp[i] = i;
   
+  // 回环线程
   thread thread_loop(&VOXEL_SLAM::thd_loop_closure, &vs, ref(n));
+  // 全局优化线程
   thread thread_gba(&VOXEL_SLAM::thd_globalmapping, &vs, ref(n));
+  // 前端建图线程
   vs.thd_odometry_localmapping(n);
 
   thread_loop.join();

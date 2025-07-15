@@ -88,8 +88,16 @@ double voxel_size = 1.0;
 int min_ba_point = 20;
 vector<double> plane_eigen_value_thre;
 
+/**
+ * @brief 计算单个点在点簇中的协方差
+ * 
+ * @param pv 
+ * @param bcov 
+ * @param vec 
+ */
 void Bf_var(const pointVar &pv, Eigen::Matrix<double, 9, 9> &bcov, const Eigen::Vector3d &vec)
 {
+  // 和论文中分成两部分计算，下面还有个 3x3 的单位阵
   Eigen::Matrix<double, 6, 3> Bi;
   // Eigen::Vector3d &vec = pv.world;
   Bi << 2*vec(0),        0,        0,
@@ -897,8 +905,8 @@ class SlideWindow
 {
 public:
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-  vector<PVec> points;
-  vector<PointCluster> pcrs_local;
+  vector<PVec> points;                  // 滑动窗口中每一帧的点云数据
+  vector<PointCluster> pcrs_local;      // 滑动窗口中每帧点云的点簇信息
 
   SlideWindow(int wdsize)
   {
@@ -940,10 +948,12 @@ public:
   PointCluster pcr_add;
   Eigen::Matrix<double, 9, 9> cov_add;
 
-  PointCluster pcr_fix;
+  PointCluster pcr_fix; // 固定点的点簇信息，应该是从其他地图中获取的
   PVec point_fix;
 
-  int layer, octo_state, wdsize;
+  int layer;
+  int octo_state;   // octo_state 0 is end of tree, 1 is not
+  int wdsize;
   OctoTree* leaves[8];
   double voxel_center[3];
   double jour = 0;
@@ -966,33 +976,50 @@ public:
     // ins = 255.0*rand()/(RAND_MAX + 1.0f);
   }
 
+  /**
+   * @brief 节点中添加点，更新点簇协方差
+   * 
+   * @param ord 
+   * @param pv 
+   * @param pw 
+   * @param sws 
+   */
   inline void push(int ord, const pointVar &pv, const Eigen::Vector3d &pw, vector<SlideWindow*> &sws)
   {
     mVox.lock();
     if(sw == nullptr)
     {
+      // 池里还有就取一个
       if(sws.size() != 0)
       {
         sw = sws.back();
         sws.pop_back();
         sw->resize(wdsize);
       }
+      // 池子空了就新建一个
       else
         sw = new SlideWindow(wdsize);
     }
     if(!isexist) isexist = true;
 
+    // 滑窗的第几帧数据
     int mord = mp[ord];
     if(layer < max_layer)
       sw->points[mord].push_back(pv);
     sw->pcrs_local[mord].push(pv.pnt);
     pcr_add.push(pw);
+    // 累加计算点簇的协方差
     Eigen::Matrix<double, 9, 9> Bi;
     Bf_var(pv, Bi, pw);
     cov_add += Bi;
     mVox.unlock();
   }
 
+  /**
+   * @brief 添加固定点，更新点簇协方差
+   * 
+   * @param pv 
+   */
   inline void push_fix(pointVar &pv)
   {
     if(layer < max_layer)
@@ -1018,6 +1045,14 @@ public:
     return (eig_values[0] < min_eigen_value && (eig_values[0]/eig_values[2])<plane_eigen_value_thre[layer]);
   }
 
+  /**
+   * @brief 递归往节点中添加点
+   * 
+   * @param ord 
+   * @param pv 
+   * @param pw 
+   * @param sws 某个线程中的滑窗池
+   */
   void allocate(int ord, const pointVar &pv, const Eigen::Vector3d &pw, vector<SlideWindow*> &sws)
   {
     if(octo_state == 0)
@@ -1071,6 +1106,11 @@ public:
     }
   }
 
+  /**
+   * @brief 把点云数据分配到各个子节点
+   * 
+   * @param sws 
+   */
   void fix_divide(vector<SlideWindow*> &sws)
   {
     for(pointVar &pv: point_fix)
@@ -1093,6 +1133,13 @@ public:
 
   }
 
+  /**
+   * @brief 把点云数据分配到各个子节点
+   * 
+   * @param si 
+   * @param xx 
+   * @param sws 
+   */
   void subdivide(int si, IMUST &xx, vector<SlideWindow*> &sws)
   {
     for(pointVar &pv: sw->points[mp[si]])
@@ -1145,6 +1192,13 @@ public:
     plane.radius = eig_value[2];
   }
 
+  /**
+   * @brief 从根节点开始，递归地拟合平面
+   * 
+   * @param win_count 
+   * @param x_buf 
+   * @param sws 
+   */
   void recut(int win_count, vector<IMUST> &x_buf, vector<SlideWindow*> &sws)
   {
     if(octo_state == 0)
@@ -1152,17 +1206,20 @@ public:
       if(layer >= 0)
       {
         opt_state = -1;
+        // 数量不足以拟合平面
         if(pcr_add.N <= min_point[layer])
         {
           plane.is_plane = false; return;
         }
         if(!isexist || sw == nullptr) return;
 
+        // 拟合平面
         Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> saes(pcr_add.cov());
         eig_value  = saes.eigenvalues();
         eig_vector = saes.eigenvectors();
         plane.is_plane = plane_judge(eig_value);
 
+        // 成功拟合平面就返回
         if(plane.is_plane)
         {
           return;
@@ -1178,15 +1235,18 @@ public:
         PVec().swap(point_fix);
       }
 
+      // 拟合不了平面再分割
       for(int i=0; i<win_count; i++)
         subdivide(i, x_buf[i], sws);
 
+      // 拟合失败才会归还滑窗
       sw->clear();
       sws.push_back(sw);
       sw = nullptr;
       octo_state = 1;
     }
 
+    // 在子节点中再尝试拟合平面
     for(int i=0; i<8; i++)
       if(leaves[i] != nullptr)
         leaves[i]->recut(win_count, x_buf, sws);
@@ -1305,12 +1365,18 @@ public:
   }
 
   // Extract the LiDAR factor
+  /**
+   * @brief 递归从voxel中提取点簇信息
+   * 
+   * @param vox_opt 
+   */
   void tras_opt(LidarFactor &vox_opt)
   {
     if(octo_state == 0)
     {
       if(layer >= 0 && isexist && plane.is_plane && sw!=nullptr)
       {
+        // 平面比较厚，放弃
         if(eig_value[0]/eig_value[1] > 0.12) return;
 
         double coe = 1;
@@ -1318,12 +1384,14 @@ public:
         for(int i=0; i<wdsize; i++)
           pcrs[i] = sw->pcrs_local[mp[i]];
         opt_state = vox_opt.plvec_voxels.size();
+        // 把滑窗中每一帧的点簇信息都存起来
         vox_opt.push_voxel(pcrs, pcr_fix, coe, eig_value, eig_vector, pcr_add);
       }
 
     }
     else
     {
+      // 当前不是叶子节点就递归搜索
       for(int i=0; i<8; i++)
         if(leaves[i] != nullptr)
           leaves[i]->tras_opt(vox_opt);
@@ -1332,9 +1400,21 @@ public:
 
   }
 
+  /**
+   * @brief 在对应的voxel中计算点是否有匹配的平面
+   * 
+   * @param wld 点的世界坐标
+   * @param pla 
+   * @param max_prob 
+   * @param var_wld 
+   * @param sigma_d 
+   * @param oc 
+   * @return int 
+   */
   int match(Eigen::Vector3d &wld, Plane* &pla, double &max_prob, Eigen::Matrix3d &var_wld, double &sigma_d, OctoTree* &oc)
   {
     int flag = 0;
+    // 已经到达最大层数
     if(octo_state == 0)
     {
       if(plane.is_plane)
@@ -1342,13 +1422,16 @@ public:
         float dis_to_plane = fabs(plane.normal.dot(wld - plane.center));
         float dis_to_center = (plane.center - wld).squaredNorm();
         float range_dis = (dis_to_center - dis_to_plane * dis_to_plane);
+        // 在平面上的投影点距离平面中心小于 3σ
         if(range_dis <= 3*3*plane.radius)
         {
+          // 计算点面距离协方差
           Eigen::Matrix<double, 1, 6> J_nq;
           J_nq.block<1, 3>(0, 0) = wld - plane.center;
           J_nq.block<1, 3>(0, 3) = -plane.normal;
           double sigma_l = J_nq * plane.plane_var * J_nq.transpose();
           sigma_l += plane.normal.transpose() * var_wld * plane.normal;
+          // 点面距离协方差小于 3σ
           if(dis_to_plane < 3 * sqrt(sigma_l))
           {
             // float prob = 1 / (sqrt(sigma_l)) * exp(-0.5 * dis_to_plane * dis_to_plane / sigma_l);
@@ -1540,8 +1623,13 @@ void cut_voxel(unordered_map<VOXEL_LOC, OctoTree*> &feat_map, PVecPtr pvec, int 
 }
 
 // Cut the current scan into corresponding voxel in multi thread
+/**
+ * @brief 将点云添加到地图中，并用多线程加速更新每个节点的滑窗
+ * 
+ */
 void cut_voxel_multi(unordered_map<VOXEL_LOC, OctoTree*> &feat_map, PVecPtr pvec, int win_count, unordered_map<VOXEL_LOC, OctoTree*> &feat_tem_map, int wdsize, PLV(3) &pwld, vector<vector<SlideWindow*>> &sws)
 {
+  // 计算每个点落在哪个voxel中，但没放进去
   unordered_map<OctoTree*, vector<int>> map_pvec;
   int plsize = pvec->size();
   for(int i=0; i<plsize; i++)
@@ -1598,6 +1686,7 @@ void cut_voxel_multi(unordered_map<VOXEL_LOC, OctoTree*> &feat_map, PVecPtr pvec
   vector<thread*> mthreads(thd_num);
   double part = 1.0 * g_size / thd_num;
 
+  // 分成5份再来做更新
   int swsize = sws[0].size() / thd_num;
   for(int i=1; i<thd_num; i++)
   {
@@ -1638,6 +1727,14 @@ void cut_voxel_multi(unordered_map<VOXEL_LOC, OctoTree*> &feat_map, PVecPtr pvec
 
 }
 
+/**
+ * @brief 往地图中添加点云
+ * 
+ * @param feat_map 
+ * @param pvec 
+ * @param wdsize 
+ * @param jour 
+ */
 void cut_voxel(unordered_map<VOXEL_LOC, OctoTree*> &feat_map, PVec &pvec, int wdsize, double jour)
 {
   for(pointVar &pv: pvec)
@@ -1671,6 +1768,17 @@ void cut_voxel(unordered_map<VOXEL_LOC, OctoTree*> &feat_map, PVec &pvec, int wd
 }
 
 // Match the point with the plane in the voxel map
+/**
+ * @brief 计算点落在哪个voxel中，并匹配点与该voxel的平面
+ * 
+ * @param feat_map 
+ * @param wld 
+ * @param pla 
+ * @param var_wld 
+ * @param sigma_d 
+ * @param oc 
+ * @return int 
+ */
 int match(unordered_map<VOXEL_LOC, OctoTree*> &feat_map, Eigen::Vector3d &wld, Plane* &pla, Eigen::Matrix3d &var_wld, double &sigma_d, OctoTree* &oc)
 {
   int flag = 0;
