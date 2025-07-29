@@ -720,12 +720,12 @@ public:
   pcl::PointCloud<PointType> pcl_path;
   IMUST x_curr, extrin_para;
   IMUEKF odom_ekf;
-  unordered_map<VOXEL_LOC, OctoTree*> surf_map, surf_map_slide;
+  unordered_map<VOXEL_LOC, OctoTree*> surf_map, surf_map_slide; // 用于滑动窗口匹配的局部地图
   double down_size;
 
   int win_size;
   vector<IMUST> x_buf;
-  vector<PVecPtr> pvec_buf;
+  vector<PVecPtr> pvec_buf;          // local系下带协方差的点云缓存
   deque<IMU_PRE*> imu_pre_buf;
   int win_count = 0, win_base = 0;
   vector<vector<SlideWindow*>> sws;  // 滑窗池，存放所有节点的滑窗，平时都放在sws[0], sws[thread_num]，用于多线程优化
@@ -1292,6 +1292,7 @@ public:
 
     if(win_count > 1)
     {
+      // 创建新的预积分
       imu_pre_buf.push_back(new IMU_PRE(x_buf[win_count-2].bg, x_buf[win_count-2].ba));
       imu_pre_buf[win_count-2]->push_imu(imus);
     }
@@ -1360,6 +1361,16 @@ public:
     ROS_WARN("Reset");
   }
 
+  /**
+   * @brief 多线程对voxel进行边缘化操作
+   * 
+   * @param feat_map 
+   * @param jour 
+   * @param win_count 
+   * @param xs 
+   * @param voxopt 
+   * @param sw 
+   */
   // After local BA, update the map and marginalize the points of oldest scan
   // multi means multiple thread
   void multi_margi(unordered_map<VOXEL_LOC, OctoTree*> &feat_map, double jour, int win_count, vector<IMUST> &xs, LidarFactor &voxopt, vector<SlideWindow*> &sw)
@@ -1422,6 +1433,7 @@ public:
       }
     }
 
+    // 如果voxel中点较少，清空voxel并归还滑窗
     for(auto iter=feat_map.begin(); iter!=feat_map.end();)
     {
       if(iter->second->isexist)
@@ -1666,6 +1678,7 @@ public:
         pvec_buf.push_back(pptr);
         if(win_count > 1)
         {
+          // 创建新的预积分
           imu_pre_buf.push_back(new IMU_PRE(x_buf[win_count-2].bg, x_buf[win_count-2].ba));
           imu_pre_buf[win_count-2]->push_imu(imus);
         }
@@ -1701,14 +1714,17 @@ public:
         }
       }
 
+      // 滑窗优化
       if(win_count >= win_size)
       {
         t4 = ros::Time::now().toSec();
         
+        // g_update=2说明在全局优化中已经优化过重力了，下面需要在滑窗中优化
         if(g_update == 2)
         {
           LI_BA_OptimizerGravity opt_lsv;
           vector<double> resis;
+          // 优化重力时需要迭代5次
           opt_lsv.damping_iter(x_buf, voxhess, imu_pre_buf, resis, &hess, 5);
           printf("g update: %lf %lf %lf: %lf\n", x_buf[0].g[0], x_buf[0].g[1], x_buf[0].g[2], x_buf[0].g.norm());
           g_update = 0;
@@ -1716,6 +1732,7 @@ public:
         }
         else
         {
+          // 不优化重力
           LI_BA_Optimizer opt_lsv;
           opt_lsv.damping_iter(x_buf, voxhess, imu_pre_buf, &hess);
         }
@@ -1759,6 +1776,7 @@ public:
           if(mp[i] >= win_size) mp[i] -= win_size;
         }
 
+        // 把第一帧移到队尾
         for(int i=mgsize; i<win_count; i++)
         {
           x_buf[i-mgsize] = x_buf[i];
@@ -1767,6 +1785,7 @@ public:
           pvec_buf[i] = pvec_tem;
         }
 
+        // 删除滑窗第一帧
         for(int i=win_count-mgsize; i<win_count; i++)
         {
           x_buf.pop_back();

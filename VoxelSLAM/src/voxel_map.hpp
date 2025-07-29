@@ -119,8 +119,8 @@ class LidarFactor
 public:
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
   vector<PointCluster> sig_vecs;
-  vector<vector<PointCluster>> plvec_voxels;
-  vector<double> coeffs;
+  vector<vector<PointCluster>> plvec_voxels;  // plvec_voxels[plane_size][win_size]
+  vector<double> coeffs;                      // coeffs[plane_size]，weight系数，但全是 1
   PLV(3) eig_values; PLM(3) eig_vectors; 
   vector<PointCluster> pcr_adds;
   int win_size;
@@ -137,6 +137,16 @@ public:
     pcr_adds.push_back(pcr_add);
   }
 
+  /**
+   * @brief 右扰动更新，对应补充材料中的公式
+   * 
+   * @param xs 
+   * @param head 
+   * @param end 
+   * @param Hess 
+   * @param JacT 
+   * @param residual 
+   */
   void acc_evaluate2(const vector<IMUST> &xs, int head, int end, Eigen::MatrixXd &Hess, Eigen::VectorXd &JacT, double &residual)
   {
     Hess.setZero(); JacT.setZero(); residual = 0;
@@ -149,6 +159,7 @@ public:
     vector<Eigen::Matrix<double, 3, 6>, Eigen::aligned_allocator<Eigen::Matrix<double, 3, 6>>> Auk(win_size);
     Eigen::Matrix3d umumT;
 
+    // 累加不同特征的雅克比和 Hessian
     for(int a=head; a<end; a++)
     {
       vector<PointCluster> &sig_orig = plvec_voxels[a];
@@ -210,6 +221,7 @@ public:
         const Eigen::Matrix<double, 6, 1> &jjt = Auk[i].transpose() * uk;
         JacT.block<6, 1>(6*i, 0) += coe * jjt;
 
+        // 计算对角部分 Hessian
         const Eigen::Matrix3d &HRt = 2.0/NN * (1.0-ni/NN) * viRiTukukT[i];
         Eigen::Matrix<double, 6, 6> Hb = Auk[i].transpose() * umumT * Auk[i];
         Hb.block<3, 3>(0, 0) += 2.0/NN * (combo1 - RiTukhat*Pi) * RiTukhat - 2.0/NN/NN * viRiTuk[i] * viRiTuk[i].transpose() - 0.5*hat(jjt.block<3, 1>(0, 0));
@@ -220,6 +232,7 @@ public:
         Hess.block<6, 6>(6*i, 6*i) += coe * Hb;
       }
 
+      // 计算非对角部分 Hessian
       for(int i=0; i<win_size-1; i++)
       // for(int i=1; i<win_size-1; i++)
       if(sig_orig[i].N != 0)
@@ -242,6 +255,7 @@ public:
       residual += coe * lmbd[kk];
     }
 
+    // 补全 Hessian
     for(int i=1; i<win_size; i++)
       for(int j=0; j<i; j++)
         Hess.block<6, 6>(6*i, 6*j) = Hess.block<6, 6>(6*j, 6*i).transpose();
@@ -460,6 +474,14 @@ class LI_BA_Optimizer
 public:
   int win_size, jac_leng, imu_leng;
 
+  /**
+   * @brief 累加 IMU 和不同线程中平面特征的雅克比和 Hessian 矩阵
+   * 
+   * @param Hess 
+   * @param JacT 
+   * @param hs 
+   * @param js 
+   */
   void hess_plus(Eigen::MatrixXd &Hess, Eigen::VectorXd &JacT, Eigen::MatrixXd &hs, Eigen::VectorXd &js)
   {
     for(int i=0; i<win_size; i++)
@@ -470,6 +492,16 @@ public:
     }
   }
 
+  /**
+   * @brief 多线程加速计算雅克比和Hessian矩阵
+   * 
+   * @param x_stats 
+   * @param voxhess 
+   * @param imus_factor 
+   * @param Hess 
+   * @param JacT 
+   * @return double 
+   */
   double divide_thread(vector<IMUST> &x_stats, LidarFactor &voxhess, deque<IMU_PRE*> &imus_factor, Eigen::MatrixXd &Hess, Eigen::VectorXd &JacT)
   {
     int thd_num = 5;
@@ -492,12 +524,14 @@ public:
 
     vector<thread*> mthreads(tthd_num);
     // for(int i=0; i<tthd_num; i++)
+    // 计算BALM的雅克比矩阵和Hessian矩阵
     for(int i=1; i<tthd_num; i++)
       mthreads[i] = new thread(&LidarFactor::acc_evaluate2, &voxhess, x_stats, part*i, part * (i+1), ref(hessians[i]), ref(jacobins[i]), ref(resis[i]));
 
     Eigen::MatrixXd jtj(2*DIM, 2*DIM);
     Eigen::VectorXd gg(2*DIM);
 
+    // 计算预积分的雅克比矩阵
     for(int i=0; i<win_size-1; i++)
     {
       jtj.setZero(); gg.setZero();
@@ -516,6 +550,7 @@ public:
 
     // printf("resi: %lf\n", residual);
 
+    // 把两部分的雅克比矩阵和Hessian矩阵加起来
     for(int i=0; i<tthd_num; i++)
     {
       // mthreads[i]->join();
@@ -527,9 +562,18 @@ public:
       delete mthreads[i];
     }
 
+    // 返回残差
     return residual;
   }
 
+  /**
+   * @brief 在输入的状态下计算残差
+   * 
+   * @param x_stats 
+   * @param voxhess 
+   * @param imus_factor 
+   * @return double 
+   */
   double only_residual(vector<IMUST> &x_stats, LidarFactor &voxhess, deque<IMU_PRE*> &imus_factor)
   {
     double residual1 = 0, residual2 = 0;
@@ -567,6 +611,14 @@ public:
     return (residual1 + residual2);
   }
 
+  /**
+   * @brief 滑窗优化函数
+   * 
+   * @param x_stats 
+   * @param voxhess 
+   * @param imus_factor 
+   * @param hess 
+   */
   void damping_iter(vector<IMUST> &x_stats, LidarFactor &voxhess, deque<IMU_PRE*> &imus_factor, Eigen::MatrixXd* hess)
   {
     win_size = voxhess.win_size;
@@ -585,25 +637,30 @@ public:
     double hesstime = 0;
     double resitime = 0;
   
+    // 迭代三次
     // for(int i=0; i<10; i++)
     for(int i=0; i<3; i++)
     {
       if(is_calc_hess)
       {
+        // 计算导数
         double tm = ros::Time::now().toSec();
         residual1 = divide_thread(x_stats, voxhess, imus_factor, Hess, JacT);
         hesstime += ros::Time::now().toSec() - tm;
         *hess = Hess;
       }
       
+      // 固定住滑窗的第一帧
       Hess.topRows(DIM).setZero();
       Hess.leftCols(DIM).setZero();
       Hess.block<DIM, DIM>(0, 0).setIdentity();
       JacT.head(DIM).setZero();
 
+      // LM法求解，马夸尔特方法，椭球形信赖域
       D.diagonal() = Hess.diagonal();
       dxi = (Hess + u*D).ldlt().solve(-JacT);
 
+      // 更新滑窗状态
       for(int j=0; j<win_size; j++)
       {
         x_stats_temp[j].R = x_stats[j].R * Exp(dxi.block<3, 1>(DIM*j, 0));
@@ -627,6 +684,7 @@ public:
       q = (residual1-residual2);
       // printf("iter%d: (%lf %lf) u: %lf v: %.1lf q: %.2lf %lf %lf\n", i, residual1, residual2, u, v, q/q1, q1, q);
 
+      // Nielsen法调整阻尼系数
       if(q > 0)
       {
         x_stats = x_stats_temp;
@@ -945,10 +1003,10 @@ class OctoTree
 public:
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
   SlideWindow* sw = nullptr;
-  PointCluster pcr_add;
+  PointCluster pcr_add; // 节点中所有点构成的平面点簇
   Eigen::Matrix<double, 9, 9> cov_add;
 
-  PointCluster pcr_fix; // 固定点的点簇信息，应该是从其他地图中获取的
+  PointCluster pcr_fix; // 固定点的点簇信息，从历史关键帧中获取
   PVec point_fix;
 
   int layer;
@@ -962,10 +1020,10 @@ public:
   Plane plane;
   bool isexist = false;
 
-  Eigen::Vector3d eig_value;
-  Eigen::Matrix3d eig_vector;
+  Eigen::Vector3d eig_value;    // 平面特征值
+  Eigen::Matrix3d eig_vector;   // 平面特征向量
 
-  int last_num = 0, opt_state = -1;
+  int last_num = 0, opt_state = -1; // voxel序号
   mutex mVox;
 
   OctoTree(int _l, int _w) : layer(_l), wdsize(_w), octo_state(0)
@@ -1253,6 +1311,14 @@ public:
 
   }
 
+  /**
+   * @brief 对voxel做递归边缘化处理，将边缘化的点云帧作为固定点，同时更新voxel中的平面信息
+   * 
+   * @param win_count 
+   * @param mgsize 
+   * @param x_buf 
+   * @param vox_opt 
+   */
   void margi(int win_count, int mgsize, vector<IMUST> &x_buf, const LidarFactor &vox_opt)
   {
     if(octo_state == 0 && layer>=0)
@@ -1313,6 +1379,7 @@ public:
         last_num = pcr_add.N;
       }
 
+      // 将边缘化的点云帧作为固定点
       if(pcr_fix.N < max_points)
       {
         for(int i=0; i<mgsize; i++)
@@ -1329,6 +1396,7 @@ public:
       }
       else
       {
+        // 如果固定点数量超过最大值，就只删除边缘化的点云帧，固定点清空
         for(int i=0; i<mgsize; i++)
           if(pcrs_world[i].N != 0)
             pcr_add -= pcrs_world[i];
@@ -1344,6 +1412,7 @@ public:
         sw->points[mp[i]].clear();
       }
       
+      // 如果剩下的点数小于固定点数，就删除该voxel
       if(pcr_fix.N >= pcr_add.N)
         isexist = false;
       else

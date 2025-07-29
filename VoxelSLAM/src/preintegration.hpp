@@ -39,7 +39,7 @@ public:
     p_bg.setZero(); p_ba.setZero();
     v_bg.setZero(); v_ba.setZero();
 
-    dtime = 0;
+    dtime = 0; // 累计时间
 
     dbg.setZero(); dba.setZero();
     dbg_buf.setZero(); dba_buf.setZero();
@@ -47,6 +47,11 @@ public:
     cov.setZero();
   }
 
+  /**
+   * @brief 传入imu数据
+   * 
+   * @param imus 
+   */
   void push_imu(deque<sensor_msgs::ImuPtr> &imus)
   {
     _imus.insert(_imus.end(), imus.begin(), imus.end());
@@ -72,6 +77,13 @@ public:
     }
   }
 
+  /**
+   * @brief 计算预积分
+   * 
+   * @param cur_gyr 
+   * @param cur_acc 
+   * @param dt 
+   */
   void add_imu(Eigen::Vector3d &cur_gyr, Eigen::Vector3d &cur_acc, double dt)
   {
     dtime += dt;
