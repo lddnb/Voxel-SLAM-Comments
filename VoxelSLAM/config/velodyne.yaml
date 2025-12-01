@@ -37,6 +37,7 @@ LocalBA:
   plane_eigen_value_thre: [4.0, 4.0, 4.0, 4.0]
   imu_coef: 0.0001
   thread_num: 5
+  enable_local_ba: false
 
 Loop:
   jud_default: 0.45
@@ -47,6 +48,7 @@ Loop:
   acsize: 2
   mgsize: 2
   isHighFly: 0
+  enable_loop_gba: false
 
 GBA:
   voxel_size: 2

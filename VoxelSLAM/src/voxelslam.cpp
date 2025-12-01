@@ -745,6 +745,8 @@ public:
   int g_update = 0;
   int thread_num = 5;
   int degrade_bound = 10;
+  bool enable_local_ba = true;
+  bool enable_loop_gba = true;
 
   vector<vector<ScanPose*>*> multimap_scanPoses;
   vector<vector<Keyframe*>*> multimap_keyframes;
@@ -821,6 +823,8 @@ public:
     n.param<vector<double>>("LocalBA/plane_eigen_value_thre", plane_eigen_value_thre, vector<double>({1, 1, 1, 1}));
     n.param<double>("LocalBA/imu_coef", imu_coef, 1e-4);
     n.param<int>("LocalBA/thread_num", thread_num, 5);
+    n.param<bool>("LocalBA/enable_local_ba", enable_local_ba, true);
+    n.param<bool>("Loop/enable_loop_gba", enable_loop_gba, true);
 
     for(double &iter: plane_eigen_value_thre) iter = 1.0 / iter;
     // for(double &iter: plane_eigen_value_thre) iter = 1.0 / iter;
@@ -1166,6 +1170,7 @@ public:
       x.v = dx.R * x.v;
       x.p = dx.R * x.p + dx.p;
       x.R = dx.R * x.R;
+      // 有跨 session 的回环，需要更新重力方向
       if(g_update == 1)
         x.g = dx.R * x.g;
       // PointType ap;
@@ -1204,6 +1209,7 @@ public:
     for(auto iter=surf_map.begin(); iter!=surf_map.end(); ++iter)
       iter->second->recut(win_count, x_buf, sws[0]);
 
+    // 有跨 session 的回环，优化后设置为 2，在后续的滑窗中继续优化
     if(g_update == 1) g_update = 2;
     loop_detect = 0;
     double t2 = ros::Time::now().toSec();
@@ -1719,30 +1725,43 @@ public:
       {
         t4 = ros::Time::now().toSec();
         
-        // g_update=2说明在全局优化中已经优化过重力了，下面需要在滑窗中优化
-        if(g_update == 2)
+        if(enable_local_ba)
         {
-          LI_BA_OptimizerGravity opt_lsv;
-          vector<double> resis;
-          // 优化重力时需要迭代5次
-          opt_lsv.damping_iter(x_buf, voxhess, imu_pre_buf, resis, &hess, 5);
-          printf("g update: %lf %lf %lf: %lf\n", x_buf[0].g[0], x_buf[0].g[1], x_buf[0].g[2], x_buf[0].g.norm());
-          g_update = 0;
-          x_curr.g = x_buf[win_count-1].g;
-        }
-        else
-        {
-          // 不优化重力
-          LI_BA_Optimizer opt_lsv;
-          opt_lsv.damping_iter(x_buf, voxhess, imu_pre_buf, &hess);
+          // g_update=2说明检测到跨 session 的回环，且在全局优化中已经优化过重力了，下面需要在滑窗中优化
+          if(g_update == 2)
+          {
+            LI_BA_OptimizerGravity opt_lsv;
+            vector<double> resis;
+            // 优化重力时需要迭代5次
+            opt_lsv.damping_iter(x_buf, voxhess, imu_pre_buf, resis, &hess, 5);
+            printf("g update: %lf %lf %lf: %lf\n", x_buf[0].g[0], x_buf[0].g[1], x_buf[0].g[2], x_buf[0].g.norm());
+            g_update = 0;
+            x_curr.g = x_buf[win_count-1].g;
+          }
+          else
+          {
+            // 一般的单次建图都是这个分支
+            LI_BA_Optimizer opt_lsv;
+            opt_lsv.damping_iter(x_buf, voxhess, imu_pre_buf, &hess);
+          }
         }
 
-        ScanPose *bl = new ScanPose(x_buf[0], pvec_buf[0]);
-        bl->v6 = hess.block<6, 6>(0, DIM).diagonal();
-        for(int i=0; i<6; i++) bl->v6[i] = 1.0 / fabs(bl->v6[i]);
-        mtx_loop.lock();
-        buf_lba2loop.push_back(bl);
-        mtx_loop.unlock();
+        if(enable_loop_gba)
+        {
+          ScanPose *bl = new ScanPose(x_buf[0], pvec_buf[0]);
+          if(enable_local_ba && hess.rows() >= 6 && hess.cols() >= DIM + 6)
+          {
+            bl->v6 = hess.block<6, 6>(0, DIM).diagonal();
+            for(int i=0; i<6; i++) bl->v6[i] = 1.0 / fabs(bl->v6[i]);
+          }
+          else
+          {
+            bl->v6.setOnes();
+          }
+          mtx_loop.lock();
+          buf_lba2loop.push_back(bl);
+          mtx_loop.unlock();
+        }
 
         x_curr.R = x_buf[win_count-1].R;
         x_curr.p = x_buf[win_count-1].p;
@@ -2121,6 +2140,8 @@ public:
                 isGraph = true;
                 isOpt = true;
                 relc_counts[id] = 0;
+                // 回环线程发现本次回环连接到一个之前未加入图优化的其他 session 需要重建全局图并优化
+                // 这意味着当前 session 的世界系要整体对齐到旧图，重力方向也要随之旋转
                 g_update = 1;
                 isPush = true;
                 jours[id] = 0;
@@ -2699,16 +2720,24 @@ int main(int argc, char **argv)
   mp = new int[vs.win_size];
   for(int i=0; i<vs.win_size; i++)
     mp[i] = i;
+
+  std::cout << "enable_local_ba: " << vs.enable_local_ba << std::endl;
+  std::cout << "enable_loop_gba: " << vs.enable_loop_gba << std::endl;
   
-  // 回环线程
-  thread thread_loop(&VOXEL_SLAM::thd_loop_closure, &vs, ref(n));
-  // 全局优化线程
-  thread thread_gba(&VOXEL_SLAM::thd_globalmapping, &vs, ref(n));
+  thread thread_loop;
+  thread thread_gba;
+  if(vs.enable_loop_gba)
+  {
+    // 回环线程
+    thread_loop = thread(&VOXEL_SLAM::thd_loop_closure, &vs, ref(n));
+    // 全局优化线程
+    thread_gba = thread(&VOXEL_SLAM::thd_globalmapping, &vs, ref(n));
+  }
   // 前端建图线程
   vs.thd_odometry_localmapping(n);
 
-  thread_loop.join();
-  thread_gba.join();
+  if(thread_loop.joinable()) thread_loop.join();
+  if(thread_gba.joinable()) thread_gba.join();
   ros::spin(); return 0;
 }
 

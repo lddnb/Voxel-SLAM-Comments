@@ -53,6 +53,7 @@ LocalBA:
   plane_eigen_value_thre: [1.0, 1.0, 1.0, 1.0]
   imu_coef: 0.000025 # 0.0001
   thread_num: 5
+  enable_local_ba: false
 
 Loop:
   # The criterion for loop closure
@@ -69,6 +70,7 @@ Loop:
   mgsize: 5
   # The parameters of BTC in normal and high altitude environment are differernt
   isHighFly: 0
+  enable_loop_gba: false
 
 GBA:
   # GBA use the coarse-to-fine strategy
