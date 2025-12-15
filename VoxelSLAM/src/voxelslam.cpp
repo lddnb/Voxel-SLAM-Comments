@@ -560,12 +560,32 @@ public:
     }
   }
 
+  /**
+   * @brief 初始化阶段的滑窗粗优化：基于累积的 win_size 帧点云/IMU 建立 voxel 地图、对齐重力并估计初始状态
+   * 
+   * @param pl_origs    原始点云序列（按时间排序，包含时间戳 curvature）
+   * @param vec_imus    每帧对应的 IMU 序列（用于去畸变与预积分）
+   * @param beg_times   每帧点云起始时间，用于 IMU 对齐
+   * @param hess        输出的 Hessian（可选，便于调试）
+   * @param voxhess     voxel 提取出的平面特征因子容器
+   * @param x_buf       滑窗内各帧状态（位姿/速度/重力等）
+   * @param surf_map    滑窗构建的 voxel 地图（世界系点簇与平面统计）
+   * @param surf_map_slide 新增/更新过的 voxel 索引表，便于 recut/margi
+   * @param pvec_buf    各帧去畸变后的点云（IMU 系），带协方差
+   * @param win_size    滑窗大小
+   * @param sws         滑窗池（每帧的 SlideWindow 指针集合，多线程分块）
+   * @param x_curr      输出：初始化后当前帧状态
+   * @param imu_pre_buf 滑窗内相邻帧的 IMU 预积分缓存
+   * @param extrin_para LiDAR-IMU 外参
+   * @return int        1 收敛成功；0 未收敛（但未触发重置）；-1 初始化失败需重置
+   */
   int motion_init(vector<pcl::PointCloud<PointType>::Ptr> &pl_origs, vector<deque<sensor_msgs::Imu::Ptr>> &vec_imus, vector<double> &beg_times, Eigen::MatrixXd *hess, LidarFactor &voxhess, vector<IMUST> &x_buf, unordered_map<VOXEL_LOC, OctoTree*> &surf_map, unordered_map<VOXEL_LOC, OctoTree*> &surf_map_slide, vector<PVecPtr> &pvec_buf, int win_size, vector<vector<SlideWindow*>> &sws, IMUST &x_curr, deque<IMU_PRE*> &imu_pre_buf, IMUST &extrin_para)
   {
     PLV(3) pwld;
     double last_g_norm = x_buf[0].g.norm();
     int converge_flag = 0;
 
+    // 初始化时放宽平面特征筛选阈值，方便找到初始约束
     double min_eigen_value_orig = min_eigen_value;
     vector<double> eigen_value_array_orig = plane_eigen_value_thre;
 
@@ -580,12 +600,14 @@ public:
     Eigen::Vector3d eigvalue; eigvalue.setZero();
     for(int iterCnt = 0; iterCnt < 10; iterCnt++)
     {
+      // 一旦收敛过一次就恢复正常阈值，开始正式优化
       if(converge_flag == 1)
       {
         min_eigen_value = min_eigen_value_orig;
         plane_eigen_value_thre = eigen_value_array_orig;
       }
 
+      // 清空上一轮的 voxel 地图与滑窗引用，准备重建
       vector<OctoTree*> octos;
       for(auto iter=surf_map.begin(); iter!=surf_map.end(); ++iter)
       {
@@ -602,33 +624,38 @@ public:
         pwld.clear();
         pvec_buf[i]->clear();
         int l = i==0 ? i : i - 1;
+        // IMU 去畸变，得到当前帧在 IMU 系下的点集（local 坐标）
         motion_blur(*pl_origs[i], *pvec_buf[i], x_buf[i], x_buf[l], vec_imus[i], beg_times[i], extrin_para);
 
         if(converge_flag == 1)
         {
+          // 已经对齐过重力后，补充点的测量协方差并转换到世界系
           for(pointVar &pv: *pvec_buf[i])
             calcBodyVar(pv.pnt, dept_err, beam_err, pv.var);
           pvec_update(pvec_buf[i], x_buf[i], pwld);
         }
         else
         {
+          // 首轮仅做刚体转换，不附带协方差
           for(pointVar &pv: *pvec_buf[i])
             pwld.push_back(x_buf[i].R * pv.pnt + x_buf[i].p);
         }
 
+        // 将该帧点云切入 surf_map，并记录滑窗引用
         cut_voxel(surf_map, pvec_buf[i], i, surf_map_slide, win_size, pwld, sws[0]);
       }
 
-      // LidarFactor voxhess(win_size);
       voxhess.clear(); voxhess.win_size = win_size;
       for(auto iter=surf_map.begin(); iter!=surf_map.end(); ++iter)
       {
+        // 基于当前窗口状态重新分配点簇并提取平面特征
         iter->second->recut(win_size, x_buf, sws[0]);
         iter->second->tras_opt(voxhess);
       }
 
       if(voxhess.plvec_voxels.size() < 10)
         break;
+      // 优化状态（包含重力），迭代 3 次
       LI_BA_OptimizerGravity opt_lsv;
       vector<double> resis;
       opt_lsv.damping_iter(x_buf, voxhess, imu_pre_buf, resis, hess, 3);
@@ -636,10 +663,12 @@ public:
 
       printf("%d: %lf %lf %lf: %lf %lf\n", iterCnt, x_buf[0].g[0], x_buf[0].g[1], x_buf[0].g[2], x_buf[0].g.norm(), fabs(resis[0] - resis[1]) / resis[0]);
 
+      // 清空上一轮的 IMU 预积分缓存
       for(int i=0; i<win_size-1; i++)
         delete imu_pre_buf[i];
       imu_pre_buf.clear();
 
+      // 根据最新的状态重新做 IMU 预积分，供下一轮使用
       for(int i=1; i<win_size; i++)
       {
         imu_pre_buf.push_back(new IMU_PRE(x_buf[i-1].bg, x_buf[i-1].ba));
@@ -648,6 +677,7 @@ public:
 
       if(fabs(resis[0] - resis[1]) / resis[0] < converge_thre && iterCnt >= 2)
       {
+        // 检查平面法向分布是否退化（特征值过小表示约束不足）
         for(Eigen::Matrix3d &iter: voxhess.eig_vectors)
         {
           Eigen::Vector3d v3 = iter.col(0);
@@ -660,6 +690,7 @@ public:
         converge_thre = 0.01;
         if(converge_flag == 0)
         {
+          // 首次达到收敛判据后，对齐重力再做一轮
           align_gravity(x_buf);
           converge_flag = 1;
           continue;
@@ -671,12 +702,14 @@ public:
 
     x_curr = x_buf[win_size - 1];
     double gnm = x_curr.g.norm();
+    // 重力幅值异常或退化则认为初始化失败
     if(is_degrade || gnm < 9.6 || gnm > 10.0)
     {
       converge_flag = 0;
     }
     if(converge_flag == 0)
     {
+      // 失败则清空地图与滑窗资源
       vector<OctoTree*> octos;
       for(auto iter=surf_map.begin(); iter!=surf_map.end(); ++iter)
       {
@@ -694,6 +727,7 @@ public:
     Eigen::Vector3d acc(vec_imus[0][0]->linear_acceleration.x, vec_imus[0][0]->linear_acceleration.y, vec_imus[0][0]->linear_acceleration.z);
     acc *= 9.8;
 
+    // 清理缓存的原始数据，释放内存
     pl_origs.clear(); vec_imus.clear(); beg_times.clear();
     double t1 = ros::Time::now().toSec();
     printf("init time: %lf\n", t1 - t0);
@@ -1194,6 +1228,7 @@ public:
       PVec pvec_tem = *(bl->pvec);
       for(pointVar &pv: pvec_tem)
         pv.pnt = xx.R * pv.pnt + xx.p;
+      // 添加固定点到地图中
       cut_voxel(surf_map, pvec_tem, win_size, 0);
     }
     
@@ -1255,7 +1290,7 @@ public:
           pv.pnt = xx.R * pv.pnt + xx.p;
           pvec.push_back(pv);
         }
-
+        // 添加固定点到地图中
         cut_voxel(surf_map, pvec, win_size, jour);
         kf.exist = 0;
         history_kfsize--;
@@ -1368,17 +1403,15 @@ public:
   }
 
   /**
-   * @brief 多线程对voxel进行边缘化操作
+   * @brief 多线程对 voxel 做边缘化：移除最旧帧的贡献，必要时删除空 voxel
    * 
-   * @param feat_map 
-   * @param jour 
-   * @param win_count 
-   * @param xs 
-   * @param voxopt 
-   * @param sw 
+   * @param feat_map  voxel 地图
+   * @param jour      当前里程计里程（用于标记 voxel）
+   * @param win_count 当前滑窗帧数
+   * @param xs        滑窗状态
+   * @param voxopt    LidarFactor（提供平面信息）
+   * @param sw        滑窗池（归还空 voxel 的 SlideWindow）
    */
-  // After local BA, update the map and marginalize the points of oldest scan
-  // multi means multiple thread
   void multi_margi(unordered_map<VOXEL_LOC, OctoTree*> &feat_map, double jour, int win_count, vector<IMUST> &xs, LidarFactor &voxopt, vector<SlideWindow*> &sw)
   {
     // for(auto iter=feat_map.begin(); iter!=feat_map.end();)
@@ -1413,6 +1446,7 @@ public:
         cnt++;
     }
 
+    // 线程函数：对分配到的 voxel 做 margi（移除最旧帧并更新平面）
     auto margi_func = [](int win_cnt, vector<OctoTree*> *oct, vector<IMUST> xxs, LidarFactor &voxhess)
     {
       for(OctoTree *oc: *oct)
@@ -1439,7 +1473,7 @@ public:
       }
     }
 
-    // 如果voxel中点较少，清空voxel并归还滑窗
+    // 清理已空/退化的 voxel，归还 SlideWindow
     for(auto iter=feat_map.begin(); iter!=feat_map.end();)
     {
       if(iter->second->isexist)
@@ -1458,13 +1492,13 @@ public:
 
   // Determine the plane and recut the voxel map in octo-tree
   /**
-   * @brief 多线程加速，对每个voxel进行初始化或者更新
+   * @brief 多线程 recut：对当前涉及的 voxel 重新拟合平面并提取因子
    * 
-   * @param feat_map 
-   * @param win_count 
-   * @param xs 
-   * @param voxopt 
-   * @param sws 
+   * @param feat_map  voxel 地图
+   * @param win_count 当前滑窗帧数
+   * @param xs        滑窗状态（用于分裂/拟合）
+   * @param voxopt    输出的 LidarFactor
+   * @param sws       多线程的 SlideWindow 池（按线程分片复用，最后合并）
    */
   void multi_recut(unordered_map<VOXEL_LOC, OctoTree*> &feat_map, int win_count, vector<IMUST> &xs, LidarFactor &voxopt, vector<vector<SlideWindow*>> &sws)
   {
@@ -1481,7 +1515,7 @@ public:
     vector<thread*> mthreads(thd_num);
     double part = 1.0 * g_size / thd_num;
     int cnt = 0;
-    // 把所有voxel五等分
+    // 按顺序分块，将 voxel 平均分配到各线程
     for(auto iter=feat_map.begin(); iter!=feat_map.end(); iter++)
     {
       octss[cnt].push_back(iter->second);
@@ -1489,7 +1523,7 @@ public:
         cnt++;
     }
 
-    // 线程函数，用于对单个线程中的所有voxel进行初始化或者更新
+    // 线程函数：对分配的 voxel 执行 recut（平面拟合/分裂）
     auto recut_func = [](int win_count, vector<OctoTree*> &oct, vector<IMUST> xxs, vector<SlideWindow*> &sw)
     {
       for(OctoTree *oc: oct)
@@ -1514,20 +1548,21 @@ public:
       }
     }
 
-    // 把所有线程的滑窗合并到第一个线程中
+    // 合并各线程归还的 SlideWindow 到第 0 线程，便于下一帧复用
     for(int i=1; i<sws.size(); i++)
     {
       sws[0].insert(sws[0].end(), sws[i].begin(), sws[i].end());
       sws[i].clear();
     }
 
-    // 遍历所有voxel，提取点簇和voxel的平面相关信息
+    // 遍历所有 voxel，提取平面点簇，生成优化因子
     for(auto iter=feat_map.begin(); iter!=feat_map.end(); iter++)
       iter->second->tras_opt(voxopt);
 
   }
 
   // The main thread of odometry and local mapping
+  // 整体流程：同步传感器→初始化/里程计→累积滑窗→建局部体素图→滑窗优化→边缘化/资源清理
   void thd_odometry_localmapping(ros::NodeHandle &n)
   {
     PLV(3) pwld;
@@ -1551,6 +1586,7 @@ public:
     while(n.ok())
     {
       ros::spinOnce();
+      // 回环触发时，先用 GBA 结果重建局部地图
       if(loop_detect == 1)
       {
         loop_update(); last_pos = x_curr.p; jour = 0;
@@ -1562,11 +1598,11 @@ public:
         break;
       }
 
-      // 当前帧点云对应的imu数据
+      // 当前帧点云对应的 IMU 数据
       deque<sensor_msgs::Imu::Ptr> imus;
       if(!sync_packages(pcl_curr, imus, odom_ekf))
       {
-        // 没成功同步数据的时候清一下地图数据，释放内存
+        // 数据不同步：做延迟清理，释放 voxel/滑窗内存
         if(octos_release.size() != 0)
         {
           int msize = octos_release.size();
@@ -1631,6 +1667,7 @@ public:
 
       if(motion_init_flag)
       {
+        // 初始化阶段：积累 win_size 帧，构建初始 voxel 地图并估计重力
         int init = initialization(imus, hess, voxhess, pwld, pcl_curr);
 
         if(init == 1)
@@ -1648,7 +1685,7 @@ public:
       }
       else
       {
-        // imu传播和点云去畸变
+        // 常规里程计：IMU 传播 + 点云去畸变
         if(odom_ekf.process(x_curr, *pcl_curr, imus) == 0)
           continue;
 
@@ -1664,7 +1701,7 @@ public:
         PVecPtr pptr(new PVec);
         var_init(extrin_para, pl_down, pptr, dept_err, beam_err);
 
-        // 里程计
+        // voxelmap中的里程计，点到平面匹配，更新当前状态
         if(lio_state_estimation(pptr))
         {
           if(degrade_cnt > 0) degrade_cnt--;
@@ -1694,13 +1731,15 @@ public:
 
         //! 滑窗中的点簇是local系下的点簇，且分了不同帧的，voxel中的点簇是world系下的点簇，所有帧都是一个点簇
         // cut_voxel(surf_map, pvec_buf[win_count-1], win_count-1, surf_map_slide, win_size, pwld, sws[0]);
+        // 往voxel地图中插入点云，并从sws中取出滑窗来分配
         cut_voxel_multi(surf_map, pvec_buf[win_count-1], win_count-1, surf_map_slide, win_size, pwld, sws);
         t2 = ros::Time::now().toSec();
 
+        // 平面拟合/分裂，并提取优化因子，如果拟合失败，将voxel的滑窗归还sws
         multi_recut(surf_map_slide, win_count, x_buf, voxhess, sws);
         t3 = ros::Time::now().toSec();
 
-        // 发生退化，重置系统
+        // 发生连续退化，重置系统
         if(degrade_cnt > degrade_bound)
         {
           degrade_cnt = 0;
@@ -1740,7 +1779,7 @@ public:
           }
           else
           {
-            // 一般的单次建图都是这个分支
+            // 一般单 session 建图：不优化重力
             LI_BA_Optimizer opt_lsv;
             opt_lsv.damping_iter(x_buf, voxhess, imu_pre_buf, &hess);
           }
@@ -1795,7 +1834,7 @@ public:
           if(mp[i] >= win_size) mp[i] -= win_size;
         }
 
-        // 把第一帧移到队尾
+        // 把第一帧移到队尾，为下一帧腾出窗口位置
         for(int i=mgsize; i<win_count; i++)
         {
           x_buf[i-mgsize] = x_buf[i];
@@ -2253,6 +2292,7 @@ public:
               pv.var(j, j) = ap.normal[j];
             pvec_tem.push_back(pv);
           }
+          // 添加固定点到地图中
           cut_voxel(map_loop, pvec_tem, win_size, 0);
         }
 
@@ -2740,4 +2780,3 @@ int main(int argc, char **argv)
   if(thread_gba.joinable()) thread_gba.join();
   ros::spin(); return 0;
 }
-

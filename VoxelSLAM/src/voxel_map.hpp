@@ -118,15 +118,26 @@ class LidarFactor
 {
 public:
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-  vector<PointCluster> sig_vecs;
-  vector<vector<PointCluster>> plvec_voxels;  // plvec_voxels[plane_size][win_size]
-  vector<double> coeffs;                      // coeffs[plane_size]，weight系数，但全是 1
-  PLV(3) eig_values; PLM(3) eig_vectors; 
-  vector<PointCluster> pcr_adds;
-  int win_size;
+  vector<PointCluster> sig_vecs;              // 每个 voxel 的固定点簇（历史边缘化累积）
+  vector<vector<PointCluster>> plvec_voxels;  // 每个 voxel 在滑窗内各帧的点簇（局部系），形状：[voxel_num][win_size]
+  vector<double> coeffs;                      // 每个 voxel 的权重系数（当前实现基本恒为 1）
+  PLV(3) eig_values;                          // 每个 voxel 的协方差特征值（最小特征值对应平面厚度）
+  PLM(3) eig_vectors;                         // 每个 voxel 的协方差特征向量（col(0) 通常作为平面法向）
+  vector<PointCluster> pcr_adds;              // 每个 voxel 的世界系累积点簇（固定点 + 滑窗点变换后）
+  int win_size;                               // 滑窗大小
 
   LidarFactor(int _w): win_size(_w){}
 
+  /**
+   * @brief 将一个 voxel 的点簇及其平面特征推入 LidarFactor 缓存
+   * 
+   * @param vec_orig  滑窗内每帧在该 voxel 的点簇（局部系）
+   * @param fix       固定点簇
+   * @param coe       权重系数（当前实现恒 1）
+   * @param eig_value 平面特征值（法向对应最小特征值）
+   * @param eig_vector 平面特征向量（列向量为主轴，col(0) 为法向）
+   * @param pcr_add   该 voxel 的累积点簇（世界系，用于协方差/中心）
+   */
   void push_voxel(vector<PointCluster> &vec_orig, PointCluster &fix, double coe, Eigen::Vector3d &eig_value, Eigen::Matrix3d &eig_vector, PointCluster &pcr_add)
   {
     plvec_voxels.push_back(vec_orig);
@@ -262,39 +273,60 @@ public:
     
   }
 
+  /**
+   * @brief 仅计算 LiDAR 部分残差（不求导），并用当前状态更新每个 voxel 的统计量
+   *
+   * 说明：
+   * - 本函数会把每个 voxel 在滑窗内各帧的点簇（局部系）按当前位姿 xs[i] 变换到世界系，
+   *   得到累积点簇 sig，并对其协方差做特征分解。
+   * - 同时会把计算得到的 eig_values/eig_vectors/pcr_adds 写回缓存，供后续边缘化阶段复用。
+   *
+   * @param xs       当前滑窗状态
+   * @param head     处理的 voxel 起始索引（多线程分块）
+   * @param end      处理的 voxel 结束索引（不含）
+   * @param residual 输出：该分块内的残差累加
+   */
   void evaluate_only_residual(const vector<IMUST> &xs, int head, int end, double &residual)
   {
     residual = 0;
     // vector<PointCluster> sig_tran(win_size);
-    int kk = 0; // The kk-th lambda value
+    int kk = 0; // 取第 kk 个特征值作为残差项（0 对应最小特征值，近似平面厚度）
 
     // int gps_size = plvec_voxels.size();
-    PointCluster pcr;
+    PointCluster pcr; // 临时点簇：用于把某帧点簇从局部系变换到世界系
 
     for(int a=head; a<end; a++)
     {
+      // sig_orig：该 voxel 在滑窗内每一帧的点簇统计（局部系）
       const vector<PointCluster> &sig_orig = plvec_voxels[a];
+      // sig：从固定点簇开始累积（历史边缘化帧贡献）
+      //! 这里的sig是临时变量，不会影响到sig_vecs[a]，也不会影响到下一次迭代
       PointCluster sig = sig_vecs[a];
 
       for(int i=0; i<win_size; i++)
       if(sig_orig[i].N != 0)
       {
+        // 将第 i 帧的点簇从局部系变换到世界系，并累加进总点簇 sig
         pcr.transform(sig_orig[i], xs[i]);
         sig += pcr;
       }
 
+      // 计算点簇均值与协方差：cov = E[xx^T] - mu mu^T
       Eigen::Vector3d vBar = sig.v / sig.N;
       // Eigen::Matrix3d cmt = sig.P/sig.N - vBar * vBar.transpose();
       // Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> saes(sig.P - sig.v * vBar.transpose());
       Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> saes(sig.P/sig.N - vBar * vBar.transpose());
       Eigen::Vector3d lmbd = saes.eigenvalues();
 
-      // centers[a] = vBar;
+      // 将本次计算得到的平面统计量写回缓存：
+      // - eig_values/eig_vectors：后续求导/边缘化会复用
+      // - pcr_adds：该 voxel 的“世界系累积点簇”（窗口点 + 固定点）
       eig_values[a] = saes.eigenvalues();
       eig_vectors[a] = saes.eigenvectors();
       pcr_adds[a] = sig;
       // Ns[a] = sig.N;
 
+      // 残差：以最小特征值衡量点簇“平面厚度”（越小越接近平面）
       residual += coeffs[a] * lmbd[kk];
     }
     
@@ -493,23 +525,23 @@ public:
   }
 
   /**
-   * @brief 多线程加速计算雅克比和Hessian矩阵
+   * @brief 多线程累加 LiDAR+IMU 的雅克比/Hessian，返回总残差
    * 
-   * @param x_stats 
-   * @param voxhess 
-   * @param imus_factor 
-   * @param Hess 
-   * @param JacT 
-   * @return double 
+   * @param x_stats     滑窗状态
+   * @param voxhess     LidarFactor（平面因子集合）
+   * @param imus_factor IMU 预积分因子
+   * @param Hess        输出：联合 Hessian
+   * @param JacT        输出：联合雅可比向量
+   * @return double     残差和（IMU*coef + LiDAR）
    */
   double divide_thread(vector<IMUST> &x_stats, LidarFactor &voxhess, deque<IMU_PRE*> &imus_factor, Eigen::MatrixXd &Hess, Eigen::VectorXd &JacT)
   {
     int thd_num = 5;
     double residual = 0;
     Hess.setZero(); JacT.setZero();
-    PLM(-1) hessians(thd_num); 
-    PLV(-1) jacobins(thd_num);
-    vector<double> resis(thd_num, 0);
+    PLM(-1) hessians(thd_num);  // 各线程局部 Hessian
+    PLV(-1) jacobins(thd_num);  // 各线程局部 JacT
+    vector<double> resis(thd_num, 0); // 各线程残差
 
     for(int i=0; i<thd_num; i++)
     {
@@ -531,7 +563,7 @@ public:
     Eigen::MatrixXd jtj(2*DIM, 2*DIM);
     Eigen::VectorXd gg(2*DIM);
 
-    // 计算预积分的雅克比矩阵
+    // IMU 部分：预积分雅可比/Hessian 累加
     for(int i=0; i<win_size-1; i++)
     {
       jtj.setZero(); gg.setZero();
@@ -550,7 +582,7 @@ public:
 
     // printf("resi: %lf\n", residual);
 
-    // 把两部分的雅克比矩阵和Hessian矩阵加起来
+    // LiDAR 部分：等待多线程结束，累加各线程结果
     for(int i=0; i<tthd_num; i++)
     {
       // mthreads[i]->join();
@@ -567,12 +599,18 @@ public:
   }
 
   /**
-   * @brief 在输入的状态下计算残差
+   * @brief 在给定状态下计算总残差（IMU + LiDAR），但不计算导数
    * 
-   * @param x_stats 
-   * @param voxhess 
-   * @param imus_factor 
-   * @return double 
+   * 说明：
+   * - IMU 部分通过预积分因子 give_evaluate(..., false) 仅累计残差；
+   * - LiDAR 部分通过 LidarFactor::evaluate_only_residual 仅累计残差，
+   *   且会把该状态下的平面统计量（eig_values/eig_vectors/pcr_adds）写回 voxhess 缓存，更新平面参数，
+   *   供后续边缘化阶段复用。
+   *
+   * @param x_stats     滑窗状态
+   * @param voxhess     LidarFactor（平面因子集合）
+   * @param imus_factor IMU 预积分因子
+   * @return double     总残差（IMU*coef + LiDAR）
    */
   double only_residual(vector<IMUST> &x_stats, LidarFactor &voxhess, deque<IMU_PRE*> &imus_factor)
   {
@@ -590,13 +628,16 @@ public:
     }
     vector<thread*> mthreads(thd_num, nullptr);
     double part = 1.0 * g_size / thd_num;
+    // 多线程计算 LiDAR 残差（每个线程处理一段 voxel）
     for(int i=1; i<thd_num; i++)
       mthreads[i] = new thread(&LidarFactor::evaluate_only_residual, &voxhess, x_stats, part*i, part*(i+1), ref(residuals[i]));
 
+    // IMU 残差：相邻帧预积分约束（不求导）
     for(int i=0; i<win_size-1; i++)
       residual1 += imus_factor[i]->give_evaluate(x_stats[i], x_stats[i+1], jtj, gg, false);
     residual1 *= (imu_coef * 0.5);
 
+    // 汇总 LiDAR 残差并等待线程结束；第 0 段在主线程计算
     for(int i=0; i<thd_num; i++)
     {
       if(i != 0) 
@@ -612,21 +653,21 @@ public:
   }
 
   /**
-   * @brief 滑窗优化函数
+   * @brief LiDAR-IMU 联合滑窗优化（LM 法），更新位姿/速度/bias
    * 
-   * @param x_stats 
-   * @param voxhess 
-   * @param imus_factor 
-   * @param hess 
+   * @param x_stats      滑窗状态向量（会被原地更新）
+   * @param voxhess      LidarFactor（平面因子集合）
+   * @param imus_factor  IMU 预积分因子
+   * @param hess         输出：最新迭代的 Hessian（可用于信息矩阵）
    */
   void damping_iter(vector<IMUST> &x_stats, LidarFactor &voxhess, deque<IMU_PRE*> &imus_factor, Eigen::MatrixXd* hess)
   {
     win_size = voxhess.win_size;
-    jac_leng = win_size * 6;
-    imu_leng = win_size * DIM;
-    double u = 0.01, v = 2;
-    Eigen::MatrixXd D(imu_leng, imu_leng), Hess(imu_leng, imu_leng);
-    Eigen::VectorXd JacT(imu_leng), dxi(imu_leng);
+    jac_leng = win_size * 6;                  // 只优化 R/p（每帧6维）时的长度
+    imu_leng = win_size * DIM;                // 全状态长度（R p v bg ba，DIM=15）
+    double u = 0.01, v = 2;                   // LM 阻尼系数及放大因子
+    Eigen::MatrixXd D(imu_leng, imu_leng), Hess(imu_leng, imu_leng); // LM 对角/雅可比累加矩阵
+    Eigen::VectorXd JacT(imu_leng), dxi(imu_leng);                   // 雅可比向量和状态增量
     hess->resize(imu_leng, imu_leng);
 
     D.setIdentity();
@@ -637,13 +678,13 @@ public:
     double hesstime = 0;
     double resitime = 0;
   
-    // 迭代三次
+    // LM 迭代（默认 3 次，可调）
     // for(int i=0; i<10; i++)
     for(int i=0; i<3; i++)
     {
       if(is_calc_hess)
       {
-        // 计算导数
+        // 计算 Jacobian/Hessian 与当前残差
         double tm = ros::Time::now().toSec();
         residual1 = divide_thread(x_stats, voxhess, imus_factor, Hess, JacT);
         hesstime += ros::Time::now().toSec() - tm;
@@ -660,7 +701,7 @@ public:
       D.diagonal() = Hess.diagonal();
       dxi = (Hess + u*D).ldlt().solve(-JacT);
 
-      // 更新滑窗状态
+      // 更新滑窗状态（右扰动）
       for(int j=0; j<win_size; j++)
       {
         x_stats_temp[j].R = x_stats[j].R * Exp(dxi.block<3, 1>(DIM*j, 0));
@@ -684,7 +725,7 @@ public:
       q = (residual1-residual2);
       // printf("iter%d: (%lf %lf) u: %lf v: %.1lf q: %.2lf %lf %lf\n", i, residual1, residual2, u, v, q/q1, q1, q);
 
-      // Nielsen法调整阻尼系数
+      // Nielsen 法调整阻尼系数 u/v，接受或回退
       if(q > 0)
       {
         x_stats = x_stats_temp;
@@ -752,7 +793,7 @@ public:
     }
 
     int tthd_num = thd_num;
-    int g_size = voxhess.plvec_voxels.size();
+    int g_size = voxhess.plvec_voxels.size(); // 平面因子数量
     if(g_size < tthd_num) tthd_num = 1;
     double part = 1.0 * g_size / tthd_num;
 
@@ -997,21 +1038,22 @@ public:
 
 // The octotree map for odometry and local mapping
 // You can re-write it in your own project
+// mp 是一个全局的映射表，用来把“滑窗的逻辑帧序号 ord”映射到 SlideWindow 内部数组的存储槽位
 int* mp;
 class OctoTree
 {
 public:
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
   SlideWindow* sw = nullptr;
-  PointCluster pcr_add; // 节点中所有点构成的平面点簇
+  PointCluster pcr_add; // 滑窗中所有点在世界系下的点簇信息 + 固定点的点簇信息
   Eigen::Matrix<double, 9, 9> cov_add;
 
-  PointCluster pcr_fix; // 固定点的点簇信息，从历史关键帧中获取
+  PointCluster pcr_fix; // 固定点的点簇信息，被边缘化后退出滑窗的点
   PVec point_fix;
 
   int layer;
   int octo_state;   // octo_state 0 is end of tree, 1 is not
-  int wdsize;
+  int wdsize;   // 滑窗大小
   OctoTree* leaves[8];
   double voxel_center[3];
   double jour = 0;
@@ -1035,12 +1077,12 @@ public:
   }
 
   /**
-   * @brief 节点中添加点，更新点簇协方差
+   * @brief 在叶子节点中插入一个点，并更新点簇/协方差与滑窗缓存
    * 
-   * @param ord 
-   * @param pv 
-   * @param pw 
-   * @param sws 
+   * @param ord  当前点所属的滑窗帧序号
+   * @param pv   点（IMU系，含协方差）
+   * @param pw   点的世界坐标
+   * @param sws  当前线程的 SlideWindow 池（复用避免频繁 new）
    */
   inline void push(int ord, const pointVar &pv, const Eigen::Vector3d &pw, vector<SlideWindow*> &sws)
   {
@@ -1065,8 +1107,8 @@ public:
     if(layer < max_layer)
       sw->points[mord].push_back(pv);
     sw->pcrs_local[mord].push(pv.pnt);
-    pcr_add.push(pw);
-    // 累加计算点簇的协方差
+    pcr_add.push(pw);                // 点簇累加（世界系）
+    // 累加点簇协方差，用于后续平面拟合
     Eigen::Matrix<double, 9, 9> Bi;
     Bf_var(pv, Bi, pw);
     cov_add += Bi;
@@ -1104,11 +1146,11 @@ public:
   }
 
   /**
-   * @brief 递归往节点中添加点
+   * @brief 递归往 OctoTree 中插入一个点：若当前为叶子则 push，否则下分八叉树
    * 
-   * @param ord 
-   * @param pv 
-   * @param pw 
+   * @param ord 当前点所属的滑窗帧序号
+   * @param pv  点（IMU系，含协方差）
+   * @param pw  点的世界坐标
    * @param sws 某个线程中的滑窗池
    */
   void allocate(int ord, const pointVar &pv, const Eigen::Vector3d &pw, vector<SlideWindow*> &sws)
@@ -1165,7 +1207,7 @@ public:
   }
 
   /**
-   * @brief 把点云数据分配到各个子节点
+   * @brief 把固定点云数据分配到各个子节点
    * 
    * @param sws 
    */
@@ -1192,11 +1234,11 @@ public:
   }
 
   /**
-   * @brief 把点云数据分配到各个子节点
+   * @brief 将当前节点某一帧的点根据世界坐标下所在象限划分到 8 个子节点
    * 
-   * @param si 
-   * @param xx 
-   * @param sws 
+   * @param si  滑窗中的帧序号
+   * @param xx  对应帧的位姿，用于把点从 IMU 系转到世界系
+   * @param sws 当前线程的滑窗池，子节点 push 时复用
    */
   void subdivide(int si, IMUST &xx, vector<SlideWindow*> &sws)
   {
@@ -1251,11 +1293,11 @@ public:
   }
 
   /**
-   * @brief 从根节点开始，递归地拟合平面
+   * @brief 递归拟合平面：叶子节点尝试拟合，否则分裂下沉到子节点
    * 
-   * @param win_count 
-   * @param x_buf 
-   * @param sws 
+   * @param win_count 当前滑窗帧数
+   * @param x_buf     滑窗状态，用于分裂时将点转到世界系
+   * @param sws       当前线程的滑窗池（分裂后归还复用）
    */
   void recut(int win_count, vector<IMUST> &x_buf, vector<SlideWindow*> &sws)
   {
@@ -1264,7 +1306,7 @@ public:
       if(layer >= 0)
       {
         opt_state = -1;
-        // 数量不足以拟合平面
+        // 数量不足直接判定不可拟合
         if(pcr_add.N <= min_point[layer])
         {
           plane.is_plane = false; return;
@@ -1277,7 +1319,7 @@ public:
         eig_vector = saes.eigenvectors();
         plane.is_plane = plane_judge(eig_value);
 
-        // 成功拟合平面就返回
+        // 拟合成功则保留为叶子，结束递归
         if(plane.is_plane)
         {
           return;
@@ -1293,18 +1335,18 @@ public:
         PVec().swap(point_fix);
       }
 
-      // 拟合不了平面再分割
+      // 拟合失败：按 8 分裂，把当前节点的各帧点分配到子节点
       for(int i=0; i<win_count; i++)
         subdivide(i, x_buf[i], sws);
 
-      // 拟合失败才会归还滑窗
+      // 分裂后归还滑窗缓存，标记为内部节点
       sw->clear();
       sws.push_back(sw);
       sw = nullptr;
       octo_state = 1;
     }
 
-    // 在子节点中再尝试拟合平面
+    // 递归对子节点继续尝试平面拟合
     for(int i=0; i<8; i++)
       if(leaves[i] != nullptr)
         leaves[i]->recut(win_count, x_buf, sws);
@@ -1312,12 +1354,12 @@ public:
   }
 
   /**
-   * @brief 对voxel做递归边缘化处理，将边缘化的点云帧作为固定点，同时更新voxel中的平面信息
+   * @brief 递归边缘化：移除滑窗最旧帧的贡献，将其转为固定点并更新平面信息
    * 
-   * @param win_count 
-   * @param mgsize 
-   * @param x_buf 
-   * @param vox_opt 
+   * @param win_count 当前滑窗帧数
+   * @param mgsize    边缘化帧数（通常 1）
+   * @param x_buf     滑窗状态
+   * @param vox_opt   LidarFactor（保存前一次优化的平面信息，可复用）
    */
   void margi(int win_count, int mgsize, vector<IMUST> &x_buf, const LidarFactor &vox_opt)
   {
@@ -1340,8 +1382,10 @@ public:
         exit(0);
       }
 
+      //! 在 only_residual 函数中会更新优化后的平面信息，所以这里可以直接复用
       if(opt_state >= 0)
       {
+        // 如果优化时已经提取过因子，直接复用当时的点簇/特征
         pcr_add = vox_opt.pcr_adds[opt_state];
         eig_value  = vox_opt.eig_values[opt_state];
         eig_vector = vox_opt.eig_vectors[opt_state];
@@ -1355,6 +1399,7 @@ public:
       }
       else
       {
+        // 否则根据当前滑窗重新累计点簇并拟合平面
         pcr_add = pcr_fix;
         for(int i=0; i<win_count; i++)
         if(sw->pcrs_local[mp[i]].N != 0)
@@ -1379,7 +1424,7 @@ public:
         last_num = pcr_add.N;
       }
 
-      // 将边缘化的点云帧作为固定点
+      // 将被边缘化的帧转换为固定点簇，累加到 pcr_fix/point_fix
       if(pcr_fix.N < max_points)
       {
         for(int i=0; i<mgsize; i++)
@@ -1396,7 +1441,7 @@ public:
       }
       else
       {
-        // 如果固定点数量超过最大值，就只删除边缘化的点云帧，固定点清空
+        // 固定点过多时只移除边缘化帧贡献，不再累加固定点
         for(int i=0; i<mgsize; i++)
           if(pcrs_world[i].N != 0)
             pcr_add -= pcrs_world[i];
@@ -1435,9 +1480,9 @@ public:
 
   // Extract the LiDAR factor
   /**
-   * @brief 递归从voxel中提取点簇信息
+   * @brief 递归提取可用的平面点簇，生成 LidarFactor 因子
    * 
-   * @param vox_opt 
+   * @param vox_opt LidarFactor 容器，收集每个 voxel 的点簇/特征
    */
   void tras_opt(LidarFactor &vox_opt)
   {
@@ -1653,6 +1698,17 @@ public:
 
 };
 
+/**
+ * @brief 单线程将当前帧点云按世界坐标划分到 voxel，并更新对应 OctoTree/滑窗
+ * 
+ * @param feat_map      全局体素地图（voxel->OctoTree）
+ * @param pvec          当前帧点云（IMU系，带协方差）
+ * @param win_count     当前帧在滑窗中的逻辑序号
+ * @param feat_tem_map  本帧涉及的 voxel 索引表（方便后续 recut/margi）
+ * @param wdsize        滑窗大小
+ * @param pwld          当前帧点云的世界坐标
+ * @param sws           当前线程可用的 SlideWindow 池
+ */
 void cut_voxel(unordered_map<VOXEL_LOC, OctoTree*> &feat_map, PVecPtr pvec, int win_count, unordered_map<VOXEL_LOC, OctoTree*> &feat_tem_map, int wdsize, PLV(3) &pwld, vector<SlideWindow*> &sws)
 {
   int plsize = pvec->size();
@@ -1671,6 +1727,7 @@ void cut_voxel(unordered_map<VOXEL_LOC, OctoTree*> &feat_map, PVecPtr pvec, int 
     auto iter = feat_map.find(position);
     if(iter != feat_map.end())
     {
+      // voxel 已存在，直接把该点分配到对应 OctoTree/滑窗槽位
       iter->second->allocate(win_count, pv, pw, sws);
       iter->second->isexist = true;
       if(feat_tem_map.find(position) == feat_map.end())
@@ -1678,6 +1735,7 @@ void cut_voxel(unordered_map<VOXEL_LOC, OctoTree*> &feat_map, PVecPtr pvec, int 
     }
     else
     {
+      // 新 voxel，创建 OctoTree 并设置中心/半径
       OctoTree* ot = new OctoTree(0, wdsize);
       ot->allocate(win_count, pv, pw, sws);
       ot->voxel_center[0] = (0.5+position.x) * voxel_size;
@@ -1688,17 +1746,24 @@ void cut_voxel(unordered_map<VOXEL_LOC, OctoTree*> &feat_map, PVecPtr pvec, int 
       feat_tem_map[position] = ot;
     }
   }
-  
+
 }
 
 // Cut the current scan into corresponding voxel in multi thread
 /**
- * @brief 将点云添加到地图中，并用多线程加速更新每个节点的滑窗
+ * @brief 将当前帧点云按 voxel 划分并分配到 OctoTree，使用多线程加速写入滑窗
  * 
+ * @param feat_map      全局 voxel 地图
+ * @param pvec          当前帧点云（IMU系，带协方差）
+ * @param win_count     当前帧在滑窗中的序号
+ * @param feat_tem_map  本帧涉及的 voxel 集合（供后续 recut/margi）
+ * @param wdsize        滑窗大小
+ * @param pwld          当前帧点云的世界坐标
+ * @param sws           多线程的 SlideWindow 池，按线程分片复用
  */
 void cut_voxel_multi(unordered_map<VOXEL_LOC, OctoTree*> &feat_map, PVecPtr pvec, int win_count, unordered_map<VOXEL_LOC, OctoTree*> &feat_tem_map, int wdsize, PLV(3) &pwld, vector<vector<SlideWindow*>> &sws)
 {
-  // 计算每个点落在哪个voxel中，但没放进去
+  // 先分桶：按 voxel 归类所有点的索引，避免在临界区逐点分配
   unordered_map<OctoTree*, vector<int>> map_pvec;
   int plsize = pvec->size();
   for(int i=0; i<plsize; i++)
@@ -1718,6 +1783,7 @@ void cut_voxel_multi(unordered_map<VOXEL_LOC, OctoTree*> &feat_map, PVecPtr pvec
     OctoTree* ot = nullptr;
     if(iter != feat_map.end())
     {
+      // 已有 voxel，标记存在并加入本帧更新表
       iter->second->isexist = true;
       if(feat_tem_map.find(position) == feat_map.end())
         feat_tem_map[position] = iter->second;
@@ -1725,6 +1791,7 @@ void cut_voxel_multi(unordered_map<VOXEL_LOC, OctoTree*> &feat_map, PVecPtr pvec
     }
     else
     {
+      // 新 voxel，创建 OctoTree 并写入地图
       ot = new OctoTree(0, wdsize);
       ot->voxel_center[0] = (0.5+position.x) * voxel_size;
       ot->voxel_center[1] = (0.5+position.y) * voxel_size;
@@ -1751,11 +1818,12 @@ void cut_voxel_multi(unordered_map<VOXEL_LOC, OctoTree*> &feat_map, PVecPtr pvec
 
   int thd_num = sws.size();
   int g_size = octs.size();
+  // voxel 数太少时不必多线程
   if(g_size < thd_num) return;
   vector<thread*> mthreads(thd_num);
   double part = 1.0 * g_size / thd_num;
 
-  // 分成5份再来做更新
+  // 分块前，把滑窗池平均分发到各线程，降低锁竞争
   int swsize = sws[0].size() / thd_num;
   for(int i=1; i<thd_num; i++)
   {
@@ -1797,7 +1865,7 @@ void cut_voxel_multi(unordered_map<VOXEL_LOC, OctoTree*> &feat_map, PVecPtr pvec
 }
 
 /**
- * @brief 往地图中添加点云
+ * @brief 往地图中添加固定点云
  * 
  * @param feat_map 
  * @param pvec 
